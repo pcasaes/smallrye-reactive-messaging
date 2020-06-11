@@ -8,11 +8,15 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.UUID;
 
+import javax.enterprise.inject.Instance;
+import javax.enterprise.inject.literal.NamedLiteral;
+
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 
 import io.smallrye.mutiny.Multi;
 import io.smallrye.reactive.messaging.kafka.IncomingKafkaRecord;
 import io.smallrye.reactive.messaging.kafka.KafkaConnectorIncomingConfiguration;
+import io.smallrye.reactive.messaging.kafka.KafkaConsumerRebalanceListener;
 import io.smallrye.reactive.messaging.kafka.fault.KafkaDeadLetterQueue;
 import io.smallrye.reactive.messaging.kafka.fault.KafkaFailStop;
 import io.smallrye.reactive.messaging.kafka.fault.KafkaFailureHandler;
@@ -26,7 +30,9 @@ public class KafkaSource<K, V> {
     private final KafkaConsumer<K, V> consumer;
     private final KafkaFailureHandler failureHandler;
 
-    public KafkaSource(Vertx vertx, KafkaConnectorIncomingConfiguration config) {
+    public KafkaSource(Vertx vertx,
+            KafkaConnectorIncomingConfiguration config,
+            Instance<KafkaConsumerRebalanceListener> consumerRebalanceListeners) {
 
         Map<String, String> kafkaConfiguration = new HashMap<>();
 
@@ -59,7 +65,21 @@ public class KafkaSource<K, V> {
         kafkaConfiguration.remove("broadcast");
         kafkaConfiguration.remove("partitions");
 
-        this.consumer = KafkaConsumer.create(vertx, kafkaConfiguration);
+        final KafkaConsumer<K, V> kafkaConsumer = KafkaConsumer.create(vertx, kafkaConfiguration);
+        config
+                .getConsumerRebalanceListenerName()
+                .map(name -> {
+                    log.info("Loading KafkaConsumerRebalanceListener " + name);
+                    return NamedLiteral.of(name);
+                })
+                .map(consumerRebalanceListeners::select)
+                .map(Instance::get)
+                .ifPresent(listener -> {
+                    kafkaConsumer.partitionsAssignedHandler(set -> listener.onPartitionsAssigned(kafkaConsumer, set));
+                    kafkaConsumer.partitionsRevokedHandler(set -> listener.onPartitionsRevoked(kafkaConsumer, set));
+                });
+        this.consumer = kafkaConsumer;
+
         String topic = config.getTopic().orElseGet(config::getChannel);
 
         failureHandler = createFailureHandler(config, vertx, kafkaConfiguration);

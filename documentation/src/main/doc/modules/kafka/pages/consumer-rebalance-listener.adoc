@@ -1,0 +1,27 @@
+[#kafka-consumer-rebalance-listener]
+=== Consumer Rebalance Listener
+
+An implementation of the consumer rebalance listener can be provided to provide fine grain controls of the assigned
+offset. Common uses are storing offsets in a separate store to enable deliver exactly-once semantics, and starting from
+a specific time window.
+
+==== Example
+
+In this example we will set-up a consumer that always starts on messages from at most 10 minutes ago. First we need to provide
+a bean managed implementation of `io.smallrye.reactive.messaging.kafka.KafkaConsumerRebalanceListener` annotated with
+`javax.inject.Named`. We then must configure our inbound connector to use this named bean.
+
+[source, java]
+----
+include::example$inbound/KafkaRebalancedConsumerRebalanceListener.java[]
+----
+
+[source, java]
+----
+include::example$inbound/KafkaRebalancedConsumer.java[]
+----
+
+Configure the inbound connector to use the provided listener:
+
+* `mp.messaging.incoming.rebalanced-example.consumer-rebalance-listener.name=rebalanced-example.rebalancer`
+
