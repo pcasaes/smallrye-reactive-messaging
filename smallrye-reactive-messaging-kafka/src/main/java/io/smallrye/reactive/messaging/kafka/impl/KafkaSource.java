@@ -4,7 +4,9 @@ import static io.smallrye.reactive.messaging.kafka.i18n.KafkaExceptions.ex;
 import static io.smallrye.reactive.messaging.kafka.i18n.KafkaLogging.log;
 
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
@@ -12,6 +14,7 @@ import javax.enterprise.inject.Instance;
 import javax.enterprise.inject.literal.NamedLiteral;
 
 import org.apache.kafka.clients.consumer.ConsumerConfig;
+import org.reactivestreams.Publisher;
 
 import io.smallrye.mutiny.Multi;
 import io.smallrye.reactive.messaging.kafka.IncomingKafkaRecord;
@@ -66,6 +69,7 @@ public class KafkaSource<K, V> {
         kafkaConfiguration.remove("partitions");
 
         final KafkaConsumer<K, V> kafkaConsumer = KafkaConsumer.create(vertx, kafkaConfiguration);
+        final List<Publisher<KafkaConsumerRecord<K, V>>> multis = new ArrayList<>();
         config
                 .getConsumerRebalanceListenerName()
                 .map(name -> {
@@ -74,18 +78,36 @@ public class KafkaSource<K, V> {
                 })
                 .map(consumerRebalanceListeners::select)
                 .map(Instance::get)
-                .ifPresent(listener -> {
-                    kafkaConsumer.partitionsAssignedHandler(set -> listener.onPartitionsAssigned(kafkaConsumer, set));
-                    kafkaConsumer.partitionsRevokedHandler(set -> listener.onPartitionsRevoked(kafkaConsumer, set));
-                });
+                .ifPresent(listener -> multis.add(Multi
+                        .createFrom()
+                        .publisher(subscriber -> {
+
+                            kafkaConsumer.partitionsAssignedHandler(set -> listener.onPartitionsAssigned(kafkaConsumer, set)
+                                    .onFailure().invoke(t -> log.unableToExecuteConsumerReblanceListener(group, t))
+                                    .subscribe()
+                                    .with(a -> log.executedConsumerRebalanceListener(group)));
+
+                            kafkaConsumer.partitionsRevokedHandler(set -> listener.onPartitionsRevoked(kafkaConsumer, set)
+                                    .onFailure().invoke(t -> log.unableToExecuteConsumerReblanceListener(group, t))
+                                    .subscribe()
+                                    .with(a -> log.executedConsumerRebalanceListener(group)));
+                        })));
         this.consumer = kafkaConsumer;
 
         String topic = config.getTopic().orElseGet(config::getChannel);
 
         failureHandler = createFailureHandler(config, vertx, kafkaConfiguration);
 
-        Multi<KafkaConsumerRecord<K, V>> multi = consumer.toMulti()
+        Multi<KafkaConsumerRecord<K, V>> consumerMulti = consumer.toMulti()
                 .onFailure().invoke(t -> log.unableToReadRecord(topic, t));
+
+        multis.add(consumerMulti);
+
+        Multi<KafkaConsumerRecord<K, V>> multi = multis.size() == 1 ? consumerMulti
+                : Multi
+                        .createBy()
+                        .merging()
+                        .streams(multis);
 
         boolean retry = config.getRetry();
         if (retry) {

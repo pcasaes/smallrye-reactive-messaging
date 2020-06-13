@@ -2,6 +2,7 @@ package io.smallrye.reactive.messaging.kafka;
 
 import java.util.Set;
 
+import io.smallrye.mutiny.Uni;
 import io.vertx.kafka.client.common.TopicPartition;
 import io.vertx.mutiny.kafka.client.consumer.KafkaConsumer;
 
@@ -24,14 +25,16 @@ public interface KafkaConsumerRebalanceListener {
      *
      * @param consumer underlying consumer
      * @param topicPartitions set of assigned topic partitions
+     * @return An observable
      */
-    void onPartitionsAssigned(KafkaConsumer<?, ?> consumer, Set<TopicPartition> topicPartitions);
+    Uni<Void> onPartitionsAssigned(KafkaConsumer<?, ?> consumer, Set<TopicPartition> topicPartitions);
 
     /**
      * Called when the consumer is revoked topic partitions
      *
      * @param consumer underlying consumer
      * @param topicPartitions set of revoked topic partitions
+     * @return An observable
      */
-    void onPartitionsRevoked(KafkaConsumer<?, ?> consumer, Set<TopicPartition> topicPartitions);
+    Uni<Void> onPartitionsRevoked(KafkaConsumer<?, ?> consumer, Set<TopicPartition> topicPartitions);
 }

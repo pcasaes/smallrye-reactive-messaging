@@ -11,6 +11,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
@@ -249,7 +250,7 @@ public class KafkaSourceTest extends KafkaTestBase {
         return config;
     }
 
-    private MapBasedConfig myKafkaSourceConfig(int partitions, boolean withConsumerRebalanceListener) {
+    private MapBasedConfig myKafkaSourceConfig(int partitions, String withConsumerRebalanceListener) {
         String prefix = "mp.messaging.incoming.data.";
         Map<String, Object> config = new HashMap<>();
         config.put(prefix + "connector", KafkaConnector.CONNECTOR_NAME);
@@ -262,25 +263,34 @@ public class KafkaSourceTest extends KafkaTestBase {
             config.put(prefix + "partitions", Integer.toString(partitions));
             config.put(prefix + "topic", "data-" + partitions);
         }
-        if (withConsumerRebalanceListener) {
-            config.put(prefix + "consumer-rebalance-listener.name", ConsumptionConsumerRebalanceListener.class.getSimpleName());
+        if (withConsumerRebalanceListener != null) {
+            config.put(prefix + "consumer-rebalance-listener.name", withConsumerRebalanceListener);
         }
 
         return new MapBasedConfig(config);
     }
 
     @Test
-    public void testABeanConsumingTheKafkaMessages() {
-        ConsumptionBean bean = deploy(myKafkaSourceConfig(0, true));
+    public void testABeanConsumingTheKafkaMessagesStartingOnFifthOffsetFromLatest() {
         KafkaUsage usage = new KafkaUsage();
-        List<Integer> list = bean.getResults();
-        assertThat(list).isEmpty();
         AtomicInteger counter = new AtomicInteger();
-        new Thread(() -> usage.produceIntegers(10, null,
+        AtomicBoolean callback = new AtomicBoolean(false);
+        new Thread(() -> usage.produceIntegers(10, () -> callback.set(true),
                 () -> new ProducerRecord<>("data", counter.getAndIncrement()))).start();
 
-        await().atMost(2, TimeUnit.MINUTES).until(() -> list.size() >= 10);
-        assertThat(list).containsExactly(1, 2, 3, 4, 5, 6, 7, 8, 9, 10);
+        await()
+                .atMost(2, TimeUnit.MINUTES)
+                .until(callback::get);
+
+        ConsumptionBeanWithoutAck bean = deployWithoutAck(
+                myKafkaSourceConfig(0, StartFromFifthOffsetFromLatestConsumerRebalanceListener.class.getSimpleName()));
+        List<Integer> list = bean.getResults();
+
+        await()
+                .atMost(2, TimeUnit.MINUTES)
+                .until(() -> list.size() >= 5);
+
+        assertThat(list).containsExactly(6, 7, 8, 9, 10);
 
         List<KafkaRecord<String, Integer>> messages = bean.getKafkaMessages();
         messages.forEach(m -> {
@@ -289,21 +299,12 @@ public class KafkaSourceTest extends KafkaTestBase {
             assertThat(m.getPartition()).isGreaterThan(-1);
         });
 
-        ConsumptionConsumerRebalanceListener consumptionConsumerRebalanceListener = getConsumptionConsumerRebalanceListener();
-        assertThat(consumptionConsumerRebalanceListener.getAssigned().isEmpty()).isFalse();
-        consumptionConsumerRebalanceListener
-                .getAssigned()
-                .values()
-                .forEach(topicPartition -> {
-                    assertThat(topicPartition.getTopic()).isEqualTo("data");
-                });
-
     }
 
     @Test
     public void testABeanConsumingTheKafkaMessagesWithPartitions() {
         kafka.createTopic("data-2", 2, 1);
-        ConsumptionBean bean = deploy(myKafkaSourceConfig(2, true));
+        ConsumptionBean bean = deploy(myKafkaSourceConfig(2, ConsumptionConsumerRebalanceListener.class.getSimpleName()));
         KafkaUsage usage = new KafkaUsage();
         List<Integer> list = bean.getResults();
         assertThat(list).isEmpty();
@@ -367,7 +368,7 @@ public class KafkaSourceTest extends KafkaTestBase {
     @SuppressWarnings("unchecked")
     @Test
     public void testABeanConsumingTheKafkaMessagesWithRawMessage() {
-        ConsumptionBeanUsingRawMessage bean = deployRaw(myKafkaSourceConfig(0, false));
+        ConsumptionBeanUsingRawMessage bean = deployRaw(myKafkaSourceConfig(0, null));
         KafkaUsage usage = new KafkaUsage();
         List<Integer> list = bean.getResults();
         assertThat(list).isEmpty();
@@ -441,14 +442,35 @@ public class KafkaSourceTest extends KafkaTestBase {
 
     }
 
+    private StartFromFifthOffsetFromLatestConsumerRebalanceListener getStartFromFifthOffsetConsumerRebalanceListener() {
+        return getBeanManager()
+                .createInstance()
+                .select(StartFromFifthOffsetFromLatestConsumerRebalanceListener.class)
+                .select(NamedLiteral.of(StartFromFifthOffsetFromLatestConsumerRebalanceListener.class.getSimpleName()))
+                .get();
+
+    }
+
     private ConsumptionBean deploy(MapBasedConfig config) {
         Weld weld = baseWeld();
         addConfig(config);
         weld.addBeanClass(ConsumptionBean.class);
         weld.addBeanClass(ConsumptionConsumerRebalanceListener.class);
+        weld.addBeanClass(StartFromFifthOffsetFromLatestConsumerRebalanceListener.class);
         weld.disableDiscovery();
         container = weld.initialize();
         return container.getBeanManager().createInstance().select(ConsumptionBean.class).get();
+    }
+
+    private ConsumptionBeanWithoutAck deployWithoutAck(MapBasedConfig config) {
+        Weld weld = baseWeld();
+        addConfig(config);
+        weld.addBeanClass(ConsumptionBeanWithoutAck.class);
+        weld.addBeanClass(ConsumptionConsumerRebalanceListener.class);
+        weld.addBeanClass(StartFromFifthOffsetFromLatestConsumerRebalanceListener.class);
+        weld.disableDiscovery();
+        container = weld.initialize();
+        return container.getBeanManager().createInstance().select(ConsumptionBeanWithoutAck.class).get();
     }
 
     private ConsumptionBeanUsingRawMessage deployRaw(MapBasedConfig config) {

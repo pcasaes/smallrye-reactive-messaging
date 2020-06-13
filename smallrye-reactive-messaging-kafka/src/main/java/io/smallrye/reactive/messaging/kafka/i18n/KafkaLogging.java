@@ -93,4 +93,12 @@ public interface KafkaLogging extends BasicLogger {
     @LogMessage(level = Logger.Level.DEBUG)
     @Message(id = 18218, value = "An exception has been caught while closing the Kafka consumer")
     void exceptionOnClose(@Cause Throwable t);
+
+    @LogMessage(level = Logger.Level.ERROR)
+    @Message(id = 18219, value = "Unable to execute consumer rebalance listener for group '%s'")
+    void unableToExecuteConsumerReblanceListener(String consumerGroup, @Cause Throwable t);
+
+    @LogMessage(level = Logger.Level.DEBUG)
+    @Message(id = 18220, value = "Executed consumer rebalance listener for group '%s'")
+    void executedConsumerRebalanceListener(String consumerGroup);
 }
