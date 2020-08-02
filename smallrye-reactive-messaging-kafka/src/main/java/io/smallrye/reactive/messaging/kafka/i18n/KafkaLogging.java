@@ -130,4 +130,12 @@ public interface KafkaLogging extends BasicLogger {
     @Message(id = 18227, value = "Re-enabling consumer for group '%s'. This consumer was paused because of a re-balance failure.")
     void reEnablingConsumerforGroup(String consumerGroup);
 
+    @LogMessage(level = Logger.Level.WARN)
+    @Message(id = 18228, value = "Unable to load initial offset for topic partition '%s'.")
+    void unableToLoadInitialOffset(String topicPartition, @Cause Throwable t);
+
+    @LogMessage(level = Logger.Level.INFO)
+    @Message(id = 18229, value = "Loading initial offset for topic partition '%s' to %d.")
+    void loadingInitialOffset(String topicPartition, long offset);
+
 }

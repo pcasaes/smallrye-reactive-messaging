@@ -21,6 +21,9 @@ import io.smallrye.reactive.messaging.kafka.fault.KafkaDeadLetterQueue;
 import io.smallrye.reactive.messaging.kafka.fault.KafkaFailStop;
 import io.smallrye.reactive.messaging.kafka.fault.KafkaFailureHandler;
 import io.smallrye.reactive.messaging.kafka.fault.KafkaIgnoreFailure;
+import io.smallrye.reactive.messaging.kafka.success.KafkaCommitHandler;
+import io.smallrye.reactive.messaging.kafka.success.KafkaIgnoreCommit;
+import io.smallrye.reactive.messaging.kafka.success.KafkaThrottledLatestProcessedCommit;
 import io.vertx.mutiny.core.Vertx;
 import io.vertx.mutiny.kafka.client.consumer.KafkaConsumer;
 import io.vertx.mutiny.kafka.client.consumer.KafkaConsumerRecord;
@@ -29,6 +32,7 @@ public class KafkaSource<K, V> {
     private final Multi<IncomingKafkaRecord<K, V>> stream;
     private final KafkaConsumer<K, V> consumer;
     private final KafkaFailureHandler failureHandler;
+    private final KafkaCommitHandler commitHandler;
 
     public KafkaSource(Vertx vertx,
             String group,
@@ -62,7 +66,9 @@ public class KafkaSource<K, V> {
         kafkaConfiguration.remove("consumer-rebalance-listener.name");
 
         final KafkaConsumer<K, V> kafkaConsumer = KafkaConsumer.create(vertx, kafkaConfiguration);
-        config
+        commitHandler = createSuccessHandler(kafkaConsumer, kafkaConfiguration);
+
+        Optional<KafkaConsumerRebalanceListener> rebalanceListener = config
                 .getConsumerRebalanceListenerName()
                 .map(name -> {
                     log.loadingConsumerRebalanceListenerFromConfiguredName(name);
@@ -80,52 +86,59 @@ public class KafkaSource<K, V> {
                         return Optional.of(rebalanceFromGroupListeners.get());
                     }
                     return Optional.empty();
-                })
-                .ifPresent(listener -> {
-                    // If the re-balance assign fails we must resume the consumer in order to force a consumer group
-                    // re-balance. To do so we must wait until after the poll interval time or
-                    // poll interval time + session timeout if group instance id is not null.
-                    // We will retry the re-balance consumer listener on failure using an exponential backoff until
-                    // we can allow the kafka consumer to do it on its own. We do this because by default it would take
-                    // 5 minutes for kafka to do this which is too long. With defaults consumerReEnableWaitTime would be
-                    // 500000 millis. We also can't simply retry indefinitely because once the consumer has been paused
-                    // for consumerReEnableWaitTime kafka will force a re-balance once resumed.
-                    final long consumerReEnableWaitTime = Long.parseLong(
-                            kafkaConfiguration.getOrDefault(ConsumerConfig.MAX_POLL_INTERVAL_MS_CONFIG, "300000"))
-                            + (kafkaConfiguration.get(ConsumerConfig.GROUP_INSTANCE_ID_CONFIG) == null ? 0L
-                                    : Long.parseLong(
-                                            kafkaConfiguration.getOrDefault(ConsumerConfig.SESSION_TIMEOUT_MS_CONFIG,
-                                                    "10000")))
-                            + 11_000L; // it's possible that it might expire 10 seconds before when we need it to
-
-                    kafkaConsumer.partitionsAssignedHandler(set -> {
-                        kafkaConsumer.pause();
-                        log.executingConsumerAssignedRebalanceListener(group);
-                        listener.onPartitionsAssigned(kafkaConsumer, set)
-                                .onFailure().invoke(t -> log.unableToExecuteConsumerAssignedRebalanceListener(group, t))
-                                .onFailure().retry().withBackOff(Duration.ofSeconds(1), Duration.ofSeconds(10))
-                                .expireIn(consumerReEnableWaitTime)
-                                .subscribe()
-                                .with(
-                                        a -> {
-                                            log.executedConsumerAssignedRebalanceListener(group);
-                                            kafkaConsumer.resume();
-                                        },
-                                        t -> {
-                                            log.reEnablingConsumerforGroup(group);
-                                            kafkaConsumer.resume();
-                                        });
-                    });
-
-                    kafkaConsumer.partitionsRevokedHandler(set -> {
-                        log.executingConsumerRevokedRebalanceListener(group);
-                        listener.onPartitionsRevoked(kafkaConsumer, set)
-                                .subscribe()
-                                .with(
-                                        a -> log.executedConsumerRevokedRebalanceListener(group),
-                                        t -> log.unableToExecuteConsumerRevokedRebalanceListener(group, t));
-                    });
                 });
+
+        if (rebalanceListener.isPresent()) {
+            KafkaConsumerRebalanceListener listener = rebalanceListener.get();
+            // If the re-balance assign fails we must resume the consumer in order to force a consumer group
+            // re-balance. To do so we must wait until after the poll interval time or
+            // poll interval time + session timeout if group instance id is not null.
+            // We will retry the re-balance consumer listener on failure using an exponential backoff until
+            // we can allow the kafka consumer to do it on its own. We do this because by default it would take
+            // 5 minutes for kafka to do this which is too long. With defaults consumerReEnableWaitTime would be
+            // 500000 millis. We also can't simply retry indefinitely because once the consumer has been paused
+            // for consumerReEnableWaitTime kafka will force a re-balance once resumed.
+            final long consumerReEnableWaitTime = Long.parseLong(
+                    kafkaConfiguration.getOrDefault(ConsumerConfig.MAX_POLL_INTERVAL_MS_CONFIG, "300000"))
+                    + (kafkaConfiguration.get(ConsumerConfig.GROUP_INSTANCE_ID_CONFIG) == null ? 0L
+                            : Long.parseLong(
+                                    kafkaConfiguration.getOrDefault(ConsumerConfig.SESSION_TIMEOUT_MS_CONFIG,
+                                            "10000")))
+                    + 11_000L; // it's possible that it might expire 10 seconds before when we need it to
+
+            kafkaConsumer.partitionsAssignedHandler(set -> {
+                kafkaConsumer.pause();
+                log.executingConsumerAssignedRebalanceListener(group);
+                listener.onPartitionsAssigned(kafkaConsumer, set)
+                        .onFailure().invoke(t -> log.unableToExecuteConsumerAssignedRebalanceListener(group, t))
+                        .onFailure().retry().withBackOff(Duration.ofSeconds(1), Duration.ofSeconds(10))
+                        .expireIn(consumerReEnableWaitTime)
+                        .subscribe()
+                        .with(
+                                a -> {
+                                    log.executedConsumerAssignedRebalanceListener(group);
+                                    commitHandler.partitionsAssigned(vertx.getOrCreateContext(), set);
+                                    kafkaConsumer.resume();
+                                },
+                                t -> {
+                                    log.reEnablingConsumerforGroup(group);
+                                    commitHandler.partitionsAssigned(vertx.getOrCreateContext(), set);
+                                    kafkaConsumer.resume();
+                                });
+            });
+
+            kafkaConsumer.partitionsRevokedHandler(set -> {
+                log.executingConsumerRevokedRebalanceListener(group);
+                listener.onPartitionsRevoked(kafkaConsumer, set)
+                        .subscribe()
+                        .with(
+                                a -> log.executedConsumerRevokedRebalanceListener(group),
+                                t -> log.unableToExecuteConsumerRevokedRebalanceListener(group, t));
+            });
+        } else {
+            kafkaConsumer.partitionsAssignedHandler(set -> commitHandler.partitionsAssigned(vertx.getOrCreateContext(), set));
+        }
+
         this.consumer = kafkaConsumer;
 
         String topic = config.getTopic().orElseGet(config::getChannel);
@@ -156,7 +169,7 @@ public class KafkaSource<K, V> {
                     // The Kafka subscription must happen on the subscription.
                     this.consumer.subscribeAndAwait(topic);
                 })
-                .map(rec -> new IncomingKafkaRecord<>(consumer, rec, failureHandler));
+                .map(rec -> new IncomingKafkaRecord<>(rec, commitHandler, failureHandler));
     }
 
     private KafkaFailureHandler createFailureHandler(KafkaConnectorIncomingConfiguration config, Vertx vertx,
@@ -174,6 +187,15 @@ public class KafkaSource<K, V> {
                 throw ex.illegalArgumentInvalidStrategy(strategy);
         }
 
+    }
+
+    private KafkaCommitHandler createSuccessHandler(KafkaConsumer<K, V> consumer,
+            Map<String, String> kafkaConfiguration) {
+        boolean enableAutoCommit = Boolean.parseBoolean(kafkaConfiguration.getOrDefault("enable.auto.commit", "true"));
+        if (enableAutoCommit) {
+            return new KafkaIgnoreCommit();
+        }
+        return new KafkaThrottledLatestProcessedCommit(consumer);
     }
 
     public Multi<IncomingKafkaRecord<K, V>> getStream() {

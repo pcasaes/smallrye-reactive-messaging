@@ -5,14 +5,14 @@
   <parent>
     <groupId>io.smallrye.reactive</groupId>
     <artifactId>smallrye-reactive-messaging</artifactId>
-    <version>2.1.1</version>
+    <version>2.1.2-SNAPSHOT</version>
     <relativePath>../..</relativePath>
   </parent>
 
   <artifactId>gcp-pubsub-quickstart</artifactId>
-  
+
   <name>SmallRye Reactive Messaging : Quickstart :: GCP Pub/Sub</name>
-  
+
   <properties>
     <maven.compiler.source>1.8</maven.compiler.source>
     <maven.compiler.target>1.8</maven.compiler.target>
