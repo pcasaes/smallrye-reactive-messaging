@@ -5,7 +5,7 @@
   <parent>
     <groupId>io.smallrye.reactive</groupId>
     <artifactId>smallrye-reactive-messaging</artifactId>
-    <version>2.3.0</version>
+    <version>2.3.1-SNAPSHOT</version>
   </parent>
 
   <artifactId>smallrye-reactive-messaging-http</artifactId>
@@ -66,7 +66,7 @@
     <plugins>
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
-        <artifactId>maven-compiler-plugin</artifactId>        
+        <artifactId>maven-compiler-plugin</artifactId>
         <configuration>
           <generatedSourcesDirectory>${project.build.directory}/generated-sources/</generatedSourcesDirectory>
           <annotationProcessors>
