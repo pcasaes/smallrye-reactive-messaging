@@ -17,6 +17,7 @@ import java.util.stream.Collectors;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 
 import io.smallrye.reactive.messaging.kafka.IncomingKafkaRecord;
+import io.smallrye.reactive.messaging.kafka.KafkaConnectorIncomingConfiguration;
 import io.smallrye.reactive.messaging.kafka.impl.KafkaSource;
 import io.vertx.kafka.client.common.TopicPartition;
 import io.vertx.kafka.client.consumer.OffsetAndMetadata;
@@ -25,14 +26,15 @@ import io.vertx.mutiny.kafka.client.consumer.KafkaConsumer;
 
 /**
  * Will keep track of received messages and commit to the next offset after the latest
- * ACKed message in sequence. Will only commit every 5 seconds.
+ * ACKed message in sequence. Will commit periodically as defined by `auto.commit.interval.ms` (default: 5000)
  * <p>
  * This strategy mimics the behavior of the kafka consumer when `enable.auto.commit`
  * is `true`.
  * <p>
- * If too many received messages are not ACKed then the KafkaSource will be marked
- * as unhealthy. "Too many" is defined as a power of two value greater than or equal
- * to `max.poll.records` times 2.
+ * The connector will be marked as unhealthy in the presence of any received record that has gone
+ * too long without being processed as defined by `throttled.unprocessed-record-max-age.ms` (default: 60000).
+ * If `throttled.unprocessed-record-max-age.ms` is set to less than or equal to 0 then will not
+ * perform any health check (this might lead to running out of memory).
  * <p>
  * This strategy guarantees at-least-once delivery even if the channel performs
  * asynchronous processing.
@@ -52,7 +54,7 @@ public class KafkaThrottledLatestProcessedCommit implements KafkaCommitHandler {
 
     private volatile Context context;
 
-    private Long timerId = null;
+    private volatile long timerId = -1;
 
     private KafkaThrottledLatestProcessedCommit(KafkaConsumer<?, ?> consumer,
             KafkaSource<?, ?> source,
@@ -69,12 +71,20 @@ public class KafkaThrottledLatestProcessedCommit implements KafkaCommitHandler {
     }
 
     public static KafkaThrottledLatestProcessedCommit create(KafkaConsumer<?, ?> consumer,
-            Map<String, String> config,
+            String groupId,
+            KafkaConnectorIncomingConfiguration config,
             KafkaSource<?, ?> source) {
 
-        int unprocessedRecordMaxAge = Integer.parseInt(config.getOrDefault("throttled.unprocessed-record-max-age", "60000"));
-        int autoCommitInterval = Integer.parseInt(config.getOrDefault(ConsumerConfig.AUTO_COMMIT_INTERVAL_MS_CONFIG, "5000"));
-        log.settingCommitInterval(config.get(ConsumerConfig.GROUP_ID_CONFIG), autoCommitInterval);
+        int unprocessedRecordMaxAge = config.getThrottledUnprocessedRecordMaxAgeMs();
+        int autoCommitInterval = config.config()
+                .getOptionalValue(ConsumerConfig.AUTO_COMMIT_INTERVAL_MS_CONFIG, Integer.class)
+                .orElse(5000);
+        log.settingCommitInterval(groupId, autoCommitInterval);
+        if (unprocessedRecordMaxAge <= 0) {
+            log.disableThrottledCommitStrategyHealthCheck(groupId);
+        } else {
+            log.setThrottledCommitStrategyReceivedRecordMaxAge(groupId, unprocessedRecordMaxAge);
+        }
         return new KafkaThrottledLatestProcessedCommit(consumer, source, unprocessedRecordMaxAge, autoCommitInterval);
 
     }
@@ -96,19 +106,24 @@ public class KafkaThrottledLatestProcessedCommit implements KafkaCommitHandler {
 
         offsetStores.clear();
 
-        if (partitions.isEmpty()) {
-            if (timerId != null) {
-                context.owner().cancelTimer(timerId);
-                timerId = null;
-            }
-        } else {
-            if (timerId == null) {
-                timerId = context
-                        .owner()
-                        .setPeriodic(autoCommitInterval, this::flushAndCheckHealth);
-            }
-        }
+        stopFlushAndCheckHealthTimer();
 
+        if (!partitions.isEmpty()) {
+            startFlushAndCheckHealthTimer();
+        }
+    }
+
+    private void stopFlushAndCheckHealthTimer() {
+        if (timerId != -1) {
+            context.owner().cancelTimer(timerId);
+            timerId = -1;
+        }
+    }
+
+    private void startFlushAndCheckHealthTimer() {
+        timerId = context
+                .owner()
+                .setTimer(autoCommitInterval, this::flushAndCheckHealth);
     }
 
     @Override
@@ -123,14 +138,9 @@ public class KafkaThrottledLatestProcessedCommit implements KafkaCommitHandler {
         Map<TopicPartition, Long> offsetsMapping = new HashMap<>();
 
         offsetStores
-                .entrySet()
-                .forEach(offsetStoreEntry -> {
-                    TopicPartition topicPartition = offsetStoreEntry.getKey();
-                    offsetStoreEntry
-                            .getValue()
-                            .clearLesserSequentiallyProcessedOffsetsAndReturnLargestOffset()
-                            .ifPresent(offset -> offsetsMapping.put(topicPartition, offset));
-                });
+                .forEach((topicPartition, value) -> value
+                        .clearLesserSequentiallyProcessedOffsetsAndReturnLargestOffset()
+                        .ifPresent(offset -> offsetsMapping.put(topicPartition, offset)));
 
         return offsetsMapping;
     }
@@ -149,6 +159,7 @@ public class KafkaThrottledLatestProcessedCommit implements KafkaCommitHandler {
     }
 
     private void flushAndCheckHealth(long timerId) {
+        this.timerId = -1;
         Map<TopicPartition, Long> offsetsMapping = clearLesserSequentiallyProcessedOffsetsAndReturnLargestOffsetMapping();
 
         if (!offsetsMapping.isEmpty()) {
@@ -157,16 +168,18 @@ public class KafkaThrottledLatestProcessedCommit implements KafkaCommitHandler {
                     .stream()
                     .collect(Collectors.toMap(Map.Entry::getKey,
                             e -> new OffsetAndMetadata().setOffset(e.getValue() + 1L)));
-            consumer.getDelegate().commit(offsets);
+            consumer.getDelegate().commit(offsets, a -> this.startFlushAndCheckHealthTimer());
+        } else {
+            this.startFlushAndCheckHealthTimer();
         }
 
-        offsetStores
-                .values()
-                .forEach(offsetStoreEntry -> {
-                    if (offsetStoreEntry.hasTooManyMessagesWithoutAck()) {
-                        this.source.reportFailure(new TooManyMessagegsWithoutAckingException());
-                    }
-                });
+        if (this.unprocessedRecordMaxAge > 0) {
+            offsetStores
+                    .values()
+                    .stream()
+                    .filter(OffsetStore::hasTooManyMessagesWithoutAck)
+                    .forEach(o -> this.source.reportFailure(new TooManyMessagegsWithoutAckingException()));
+        }
     }
 
     private static class OffsetReceivedAt {

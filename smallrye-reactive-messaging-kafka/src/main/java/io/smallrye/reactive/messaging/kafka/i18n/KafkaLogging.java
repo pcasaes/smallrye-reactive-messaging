@@ -155,4 +155,16 @@ public interface KafkaLogging extends BasicLogger {
     @Message(id = 18232, value = "Will commit for group '%s' every %d milliseconds.")
     void settingCommitInterval(String group, long commitInterval);
 
+    @LogMessage(level = Logger.Level.ERROR)
+    @Message(id = 18233, value = "Invalid value serializer to write a structured Cloud Event. Found %d, expected the org.apache.kafka.common.serialization.StringSerializer")
+    void invalidValueSerializerForStructuredCloudEvent(String serializer);
+
+    @LogMessage(level = Logger.Level.WARN)
+    @Message(id = 18234, value = "Will not health check throttled commit strategy for group '%s'.")
+    void disableThrottledCommitStrategyHealthCheck(String group);
+
+    @LogMessage(level = Logger.Level.INFO)
+    @Message(id = 18235, value = "Will mark throttled commit strategy for group '%s' as unhealthy if records go more than %d milliseconds without being processed.")
+    void setThrottledCommitStrategyReceivedRecordMaxAge(String group, long unprocessedRecordMaxAge);
+
 }
