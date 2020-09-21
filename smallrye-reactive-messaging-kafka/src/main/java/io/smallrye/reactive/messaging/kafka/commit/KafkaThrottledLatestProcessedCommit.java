@@ -26,52 +26,42 @@ import io.vertx.mutiny.kafka.client.consumer.KafkaConsumer;
 /**
  * Will keep track of received messages and commit to the next offset after the latest
  * ACKed message in sequence. Will only commit every 5 seconds.
- *
+ * <p>
  * This strategy mimics the behavior of the kafka consumer when `enable.auto.commit`
  * is `true`.
- *
+ * <p>
  * If too many received messages are not ACKed then the KafkaSource will be marked
  * as unhealthy. "Too many" is defined as a power of two value greater than or equal
  * to `max.poll.records` times 2.
- *
+ * <p>
  * This strategy guarantees at-least-once delivery even if the channel performs
  * asynchronous processing.
- *
+ * <p>
  * To use set `commit-strategy` to `throttled`.
  */
 public class KafkaThrottledLatestProcessedCommit implements KafkaCommitHandler {
 
-    private static final long THROTTLE_TIME_IN_MILLIS = 5_000L;
     private static final Map<String, Map<Integer, TopicPartition>> TOPIC_PARTITIONS_CACHE = new ConcurrentHashMap<>();
 
     private final Map<TopicPartition, OffsetStore> offsetStores = new HashMap<>();
 
     private final KafkaConsumer<?, ?> consumer;
     private final KafkaSource<?, ?> source;
-    private final int maxReceivedWithoutAckAllowed;
+    private final int unprocessedRecordMaxAge;
+    private final int autoCommitInterval;
 
     private volatile Context context;
-    private long nextCommitTime;
+
+    private Long timerId = null;
 
     private KafkaThrottledLatestProcessedCommit(KafkaConsumer<?, ?> consumer,
             KafkaSource<?, ?> source,
-            int maxReceivedWithoutAckAllowed) {
+            int unprocessedRecordMaxAge,
+            int autoCommitInterval) {
         this.consumer = consumer;
         this.source = source;
-        this.maxReceivedWithoutAckAllowed = maxReceivedWithoutAckAllowed;
-    }
-
-    private static int getNextPowerOfTwoEqualOrGreater(int v) {
-        if (v <= 0)
-            return 1;
-        v--;
-        v |= v >>> 1;
-        v |= v >>> 2;
-        v |= v >>> 4;
-        v |= v >>> 8;
-        v |= v >>> 16;
-        v++;
-        return v;
+        this.unprocessedRecordMaxAge = unprocessedRecordMaxAge;
+        this.autoCommitInterval = autoCommitInterval;
     }
 
     public static void clearCache() {
@@ -82,10 +72,10 @@ public class KafkaThrottledLatestProcessedCommit implements KafkaCommitHandler {
             Map<String, String> config,
             KafkaSource<?, ?> source) {
 
-        int maxPollRecords = Integer.parseInt(config.getOrDefault(ConsumerConfig.MAX_POLL_RECORDS_CONFIG, "500"));
-        int maxReceivedWithoutAckAllowed = getNextPowerOfTwoEqualOrGreater(maxPollRecords * 2);
-        log.settingMaxReceivedWithoutAckAllowed(config.get(ConsumerConfig.GROUP_ID_CONFIG), maxReceivedWithoutAckAllowed);
-        return new KafkaThrottledLatestProcessedCommit(consumer, source, maxReceivedWithoutAckAllowed);
+        int unprocessedRecordMaxAge = Integer.parseInt(config.getOrDefault("throttled.unprocessed-record-max-age", "60000"));
+        int autoCommitInterval = Integer.parseInt(config.getOrDefault(ConsumerConfig.AUTO_COMMIT_INTERVAL_MS_CONFIG, "5000"));
+        log.settingCommitInterval(config.get(ConsumerConfig.GROUP_ID_CONFIG), autoCommitInterval);
+        return new KafkaThrottledLatestProcessedCommit(consumer, source, unprocessedRecordMaxAge, autoCommitInterval);
 
     }
 
@@ -97,7 +87,7 @@ public class KafkaThrottledLatestProcessedCommit implements KafkaCommitHandler {
 
     private OffsetStore getOffsetStore(TopicPartition topicPartition) {
         return offsetStores
-                .computeIfAbsent(topicPartition, t -> new OffsetStore(t, this.maxReceivedWithoutAckAllowed));
+                .computeIfAbsent(topicPartition, k -> new OffsetStore(k, unprocessedRecordMaxAge));
     }
 
     @Override
@@ -106,23 +96,27 @@ public class KafkaThrottledLatestProcessedCommit implements KafkaCommitHandler {
 
         offsetStores.clear();
 
-        resetNextCommitTime();
+        if (partitions.isEmpty()) {
+            if (timerId != null) {
+                context.owner().cancelTimer(timerId);
+                timerId = null;
+            }
+        } else {
+            if (timerId == null) {
+                timerId = context
+                        .owner()
+                        .setPeriodic(autoCommitInterval, this::flushAndCheckHealth);
+            }
+        }
+
     }
 
     @Override
     public <K, V> IncomingKafkaRecord<K, V> received(IncomingKafkaRecord<K, V> record) {
         TopicPartition recordsTopicPartition = getTopicPartition(record);
-        try {
-            getOffsetStore(recordsTopicPartition).received(record.getOffset());
-        } catch (TooManyMessagegsWithoutAckingException ex) {
-            this.source.reportFailure(ex);
-        }
+        getOffsetStore(recordsTopicPartition).received(record.getOffset());
 
         return record;
-    }
-
-    private void resetNextCommitTime() {
-        this.nextCommitTime = System.currentTimeMillis() + THROTTLE_TIME_IN_MILLIS;
     }
 
     private Map<TopicPartition, Long> clearLesserSequentiallyProcessedOffsetsAndReturnLargestOffsetMapping() {
@@ -148,55 +142,75 @@ public class KafkaThrottledLatestProcessedCommit implements KafkaCommitHandler {
             offsetStores
                     .get(getTopicPartition(record))
                     .processed(record.getOffset());
-
-            if (System.currentTimeMillis() > this.nextCommitTime) {
-                resetNextCommitTime();
-                Map<TopicPartition, Long> offsetsMapping = clearLesserSequentiallyProcessedOffsetsAndReturnLargestOffsetMapping();
-
-                if (!offsetsMapping.isEmpty()) {
-                    Map<TopicPartition, OffsetAndMetadata> offsets = offsetsMapping
-                            .entrySet()
-                            .stream()
-                            .collect(Collectors.toMap(Map.Entry::getKey,
-                                    e -> new OffsetAndMetadata().setOffset(e.getValue() + 1L)));
-                    consumer.getDelegate().commit(offsets, a -> future.complete(null));
-
-                    return;
-                }
-            }
             future.complete(null);
         });
         return future;
 
     }
 
+    private void flushAndCheckHealth(long timerId) {
+        Map<TopicPartition, Long> offsetsMapping = clearLesserSequentiallyProcessedOffsetsAndReturnLargestOffsetMapping();
+
+        if (!offsetsMapping.isEmpty()) {
+            Map<TopicPartition, OffsetAndMetadata> offsets = offsetsMapping
+                    .entrySet()
+                    .stream()
+                    .collect(Collectors.toMap(Map.Entry::getKey,
+                            e -> new OffsetAndMetadata().setOffset(e.getValue() + 1L)));
+            consumer.getDelegate().commit(offsets);
+        }
+
+        offsetStores
+                .values()
+                .forEach(offsetStoreEntry -> {
+                    if (offsetStoreEntry.hasTooManyMessagesWithoutAck()) {
+                        this.source.reportFailure(new TooManyMessagegsWithoutAckingException());
+                    }
+                });
+    }
+
+    private static class OffsetReceivedAt {
+        private final long offset;
+        private final long receivedAt;
+
+        private OffsetReceivedAt(long offset, long receivedAt) {
+            this.offset = offset;
+            this.receivedAt = receivedAt;
+        }
+
+        static OffsetReceivedAt received(long offset) {
+            return new OffsetReceivedAt(offset, System.currentTimeMillis());
+        }
+
+        public long getOffset() {
+            return offset;
+        }
+
+        public long getReceivedAt() {
+            return receivedAt;
+        }
+    }
+
     private static class OffsetStore {
 
         private final TopicPartition topicPartition;
-        private final Queue<Long> receivedOffsets = new LinkedList<>();
+        private final Queue<OffsetReceivedAt> receivedOffsets = new LinkedList<>();
         private final Set<Long> processedOffsets = new HashSet<>();
-        private final int maxReceivedWithoutAckAllowed;
-        private final int maxReceivedWithoutAckAllowedMinusOne;
+        private final int unprocessedRecordMaxAge;
         private long unProcessedTotal = 0L;
 
-        OffsetStore(TopicPartition topicPartition, int maxReceivedWithoutAckAllowed) {
+        OffsetStore(TopicPartition topicPartition, int unprocessedRecordMaxAge) {
             this.topicPartition = topicPartition;
-            this.maxReceivedWithoutAckAllowed = maxReceivedWithoutAckAllowed;
-            this.maxReceivedWithoutAckAllowedMinusOne = maxReceivedWithoutAckAllowed - 1;
+            this.unprocessedRecordMaxAge = unprocessedRecordMaxAge;
         }
 
-        void received(long offset) throws TooManyMessagegsWithoutAckingException {
-            this.receivedOffsets.offer(offset);
+        void received(long offset) {
+            this.receivedOffsets.offer(OffsetReceivedAt.received(offset));
             unProcessedTotal++;
-            if (unProcessedTotal >= maxReceivedWithoutAckAllowed &&
-                    (unProcessedTotal & maxReceivedWithoutAckAllowedMinusOne) == 0) {
-                log.receivedTooManyMessagesWithoutAcking(topicPartition.toString(), unProcessedTotal);
-                throw new TooManyMessagegsWithoutAckingException();
-            }
         }
 
         void processed(long offset) {
-            if (!this.receivedOffsets.isEmpty() && this.receivedOffsets.peek() <= offset) {
+            if (!this.receivedOffsets.isEmpty() && this.receivedOffsets.peek().getOffset() <= offset) {
                 processedOffsets.add(offset);
             }
         }
@@ -205,11 +219,11 @@ public class KafkaThrottledLatestProcessedCommit implements KafkaCommitHandler {
             if (!processedOffsets.isEmpty()) {
                 long largestSequentialProcessedOffset = -1;
                 while (!receivedOffsets.isEmpty()) {
-                    if (!processedOffsets.remove(receivedOffsets.peek())) {
+                    if (!processedOffsets.remove(receivedOffsets.peek().getOffset())) {
                         break;
                     }
                     unProcessedTotal--;
-                    largestSequentialProcessedOffset = receivedOffsets.poll();
+                    largestSequentialProcessedOffset = receivedOffsets.poll().getOffset();
                 }
 
                 if (largestSequentialProcessedOffset > -1) {
@@ -217,6 +231,17 @@ public class KafkaThrottledLatestProcessedCommit implements KafkaCommitHandler {
                 }
             }
             return OptionalLong.empty();
+        }
+
+        boolean hasTooManyMessagesWithoutAck() {
+            if (receivedOffsets.isEmpty()) {
+                return false;
+            }
+            if (System.currentTimeMillis() - receivedOffsets.peek().getReceivedAt() > unprocessedRecordMaxAge) {
+                log.receivedTooManyMessagesWithoutAcking(topicPartition.toString(), unProcessedTotal);
+                return true;
+            }
+            return false;
         }
     }
 

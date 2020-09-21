@@ -152,7 +152,7 @@ public interface KafkaLogging extends BasicLogger {
     void receivedTooManyMessagesWithoutAcking(String topicPartition, long amount);
 
     @LogMessage(level = Logger.Level.INFO)
-    @Message(id = 18232, value = "Setting the max received messages without acking limit for group '%s' to %d.")
-    void settingMaxReceivedWithoutAckAllowed(String group, long amount);
+    @Message(id = 18232, value = "Will commit for group '%s' every %d milliseconds.")
+    void settingCommitInterval(String group, long commitInterval);
 
 }
