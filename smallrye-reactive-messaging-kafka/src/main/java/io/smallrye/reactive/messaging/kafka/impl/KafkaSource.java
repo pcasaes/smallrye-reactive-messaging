@@ -101,7 +101,7 @@ public class KafkaSource<K, V> {
         kafkaConfiguration.remove("health.enabled");
 
         final KafkaConsumer<K, V> kafkaConsumer = KafkaConsumer.create(vertx, kafkaConfiguration);
-        commitHandler = createCommitHandler(kafkaConsumer, group, config, commitStrategy);
+        commitHandler = createCommitHandler(vertx, kafkaConsumer, group, config, commitStrategy);
 
         Map<String, Object> adminConfiguration = new HashMap<>(kafkaConfiguration);
         this.admin = KafkaAdminHelper.createAdminClient(this.configuration, vertx, adminConfiguration);
@@ -148,7 +148,7 @@ public class KafkaSource<K, V> {
                 final long currentDemand = kafkaConsumer.getDelegate().demand();
                 kafkaConsumer.pause();
 
-                commitHandler.partitionsAssigned(vertx.getOrCreateContext(), set);
+                commitHandler.partitionsAssigned(set);
 
                 log.executingConsumerAssignedRebalanceListener(group);
                 listener.onPartitionsAssigned(kafkaConsumer, set)
@@ -176,7 +176,7 @@ public class KafkaSource<K, V> {
                                 t -> log.unableToExecuteConsumerRevokedRebalanceListener(group, t));
             });
         } else {
-            kafkaConsumer.partitionsAssignedHandler(set -> commitHandler.partitionsAssigned(vertx.getOrCreateContext(), set));
+            kafkaConsumer.partitionsAssignedHandler(commitHandler::partitionsAssigned);
         }
 
         this.consumer = kafkaConsumer;
@@ -282,18 +282,20 @@ public class KafkaSource<K, V> {
 
     }
 
-    private KafkaCommitHandler createCommitHandler(KafkaConsumer<K, V> consumer,
+    private KafkaCommitHandler createCommitHandler(
+            Vertx vertx,
+            KafkaConsumer<K, V> consumer,
             String group,
             KafkaConnectorIncomingConfiguration config,
             String strategy) {
         KafkaCommitHandler.Strategy actualStrategy = KafkaCommitHandler.Strategy.from(strategy);
         switch (actualStrategy) {
             case LATEST:
-                return new KafkaLatestCommit(consumer);
+                return new KafkaLatestCommit(vertx, consumer);
             case IGNORE:
                 return new KafkaIgnoreCommit();
             case THROTTLED:
-                return KafkaThrottledLatestProcessedCommit.create(consumer, group, config, this);
+                return KafkaThrottledLatestProcessedCommit.create(vertx, consumer, group, config, this);
             default:
                 throw ex.illegalArgumentInvalidCommitStrategy(strategy);
         }

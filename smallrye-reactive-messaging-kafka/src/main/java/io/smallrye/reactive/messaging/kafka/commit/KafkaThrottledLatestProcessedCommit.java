@@ -2,13 +2,7 @@ package io.smallrye.reactive.messaging.kafka.commit;
 
 import static io.smallrye.reactive.messaging.kafka.i18n.KafkaLogging.log;
 
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.LinkedList;
-import java.util.Map;
-import java.util.OptionalLong;
-import java.util.Queue;
-import java.util.Set;
+import java.util.*;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ConcurrentHashMap;
@@ -22,6 +16,7 @@ import io.smallrye.reactive.messaging.kafka.impl.KafkaSource;
 import io.vertx.kafka.client.common.TopicPartition;
 import io.vertx.kafka.client.consumer.OffsetAndMetadata;
 import io.vertx.mutiny.core.Context;
+import io.vertx.mutiny.core.Vertx;
 import io.vertx.mutiny.kafka.client.consumer.KafkaConsumer;
 
 /**
@@ -51,12 +46,14 @@ public class KafkaThrottledLatestProcessedCommit implements KafkaCommitHandler {
     private final KafkaSource<?, ?> source;
     private final int unprocessedRecordMaxAge;
     private final int autoCommitInterval;
+    private final Vertx vertx;
 
     private volatile Context context;
-
     private volatile long timerId = -1;
 
-    private KafkaThrottledLatestProcessedCommit(KafkaConsumer<?, ?> consumer,
+    private KafkaThrottledLatestProcessedCommit(
+            Vertx vertx,
+            KafkaConsumer<?, ?> consumer,
             KafkaSource<?, ?> source,
             int unprocessedRecordMaxAge,
             int autoCommitInterval) {
@@ -64,13 +61,16 @@ public class KafkaThrottledLatestProcessedCommit implements KafkaCommitHandler {
         this.source = source;
         this.unprocessedRecordMaxAge = unprocessedRecordMaxAge;
         this.autoCommitInterval = autoCommitInterval;
+        this.vertx = vertx;
     }
 
     public static void clearCache() {
         TOPIC_PARTITIONS_CACHE.clear();
     }
 
-    public static KafkaThrottledLatestProcessedCommit create(KafkaConsumer<?, ?> consumer,
+    public static KafkaThrottledLatestProcessedCommit create(
+            Vertx vertx,
+            KafkaConsumer<?, ?> consumer,
             String groupId,
             KafkaConnectorIncomingConfiguration config,
             KafkaSource<?, ?> source) {
@@ -85,7 +85,8 @@ public class KafkaThrottledLatestProcessedCommit implements KafkaCommitHandler {
         } else {
             log.setThrottledCommitStrategyReceivedRecordMaxAge(groupId, unprocessedRecordMaxAge);
         }
-        return new KafkaThrottledLatestProcessedCommit(consumer, source, unprocessedRecordMaxAge, autoCommitInterval);
+        return new KafkaThrottledLatestProcessedCommit(vertx, consumer, source, unprocessedRecordMaxAge,
+                autoCommitInterval);
 
     }
 
@@ -101,9 +102,7 @@ public class KafkaThrottledLatestProcessedCommit implements KafkaCommitHandler {
     }
 
     @Override
-    public void partitionsAssigned(Context context, Set<TopicPartition> partitions) {
-        this.context = context;
-
+    public void partitionsAssigned(Set<TopicPartition> partitions) {
         offsetStores.clear();
 
         stopFlushAndCheckHealthTimer();
@@ -115,21 +114,23 @@ public class KafkaThrottledLatestProcessedCommit implements KafkaCommitHandler {
 
     private void stopFlushAndCheckHealthTimer() {
         if (timerId != -1) {
-            context.owner().cancelTimer(timerId);
+            vertx.cancelTimer(timerId);
             timerId = -1;
         }
     }
 
     private void startFlushAndCheckHealthTimer() {
-        timerId = context
-                .owner()
-                .setTimer(autoCommitInterval, this::flushAndCheckHealth);
+        timerId = vertx.setTimer(autoCommitInterval, this::flushAndCheckHealth);
     }
 
     @Override
     public <K, V> IncomingKafkaRecord<K, V> received(IncomingKafkaRecord<K, V> record) {
         TopicPartition recordsTopicPartition = getTopicPartition(record);
         getOffsetStore(recordsTopicPartition).received(record.getOffset());
+
+        if (timerId < 0) {
+            startFlushAndCheckHealthTimer();
+        }
 
         return record;
     }
@@ -148,7 +149,8 @@ public class KafkaThrottledLatestProcessedCommit implements KafkaCommitHandler {
     @Override
     public <K, V> CompletionStage<Void> handle(final IncomingKafkaRecord<K, V> record) {
         CompletableFuture<Void> future = new CompletableFuture<>();
-        context.runOnContext(v -> {
+        Context ctxt = getContext();
+        ctxt.runOnContext(v -> {
             offsetStores
                     .get(getTopicPartition(record))
                     .processed(record.getOffset());
@@ -158,28 +160,43 @@ public class KafkaThrottledLatestProcessedCommit implements KafkaCommitHandler {
 
     }
 
+    private Context getContext() {
+        Context ctx = this.context;
+        if (ctx == null) {
+            synchronized (this) {
+                ctx = this.context;
+                if (ctx == null) {
+                    this.context = ctx = vertx.getOrCreateContext();
+                }
+            }
+        }
+        return ctx;
+    }
+
     private void flushAndCheckHealth(long timerId) {
-        this.timerId = -1;
-        Map<TopicPartition, Long> offsetsMapping = clearLesserSequentiallyProcessedOffsetsAndReturnLargestOffsetMapping();
+        // The timer may be on another context, so make sure we are on the right one to access the store.
+        getContext().runOnContext(x -> {
+            Map<TopicPartition, Long> offsetsMapping = clearLesserSequentiallyProcessedOffsetsAndReturnLargestOffsetMapping();
 
-        if (!offsetsMapping.isEmpty()) {
-            Map<TopicPartition, OffsetAndMetadata> offsets = offsetsMapping
-                    .entrySet()
-                    .stream()
-                    .collect(Collectors.toMap(Map.Entry::getKey,
-                            e -> new OffsetAndMetadata().setOffset(e.getValue() + 1L)));
-            consumer.getDelegate().commit(offsets, a -> this.startFlushAndCheckHealthTimer());
-        } else {
-            this.startFlushAndCheckHealthTimer();
-        }
+            if (!offsetsMapping.isEmpty()) {
+                Map<TopicPartition, OffsetAndMetadata> offsets = offsetsMapping
+                        .entrySet().stream()
+                        .collect(Collectors.toMap(Map.Entry::getKey,
+                                e -> new OffsetAndMetadata().setOffset(e.getValue() + 1L)));
+                consumer.getDelegate().commit(offsets, a -> this.startFlushAndCheckHealthTimer());
+            } else {
+                this.startFlushAndCheckHealthTimer();
+            }
 
-        if (this.unprocessedRecordMaxAge > 0) {
-            offsetStores
-                    .values()
-                    .stream()
-                    .filter(OffsetStore::hasTooManyMessagesWithoutAck)
-                    .forEach(o -> this.source.reportFailure(new TooManyMessagegsWithoutAckingException()));
-        }
+            if (this.unprocessedRecordMaxAge > 0) {
+                offsetStores
+                        .values()
+                        .stream()
+                        .filter(OffsetStore::hasTooManyMessagesWithoutAck)
+                        .forEach(o -> this.source.reportFailure(new TooManyMessagesWithoutAckException()));
+            }
+        });
+
     }
 
     private static class OffsetReceivedAt {
@@ -258,9 +275,9 @@ public class KafkaThrottledLatestProcessedCommit implements KafkaCommitHandler {
         }
     }
 
-    public static class TooManyMessagegsWithoutAckingException extends Exception {
-        public TooManyMessagegsWithoutAckingException() {
-            super("Too Many Messages without Acking");
+    public static class TooManyMessagesWithoutAckException extends Exception {
+        public TooManyMessagesWithoutAckException() {
+            super("Too Many Messages without Ack");
         }
     }
 
