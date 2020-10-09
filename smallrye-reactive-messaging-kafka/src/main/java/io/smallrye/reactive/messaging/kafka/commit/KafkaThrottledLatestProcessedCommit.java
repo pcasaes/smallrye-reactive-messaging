@@ -2,11 +2,25 @@ package io.smallrye.reactive.messaging.kafka.commit;
 
 import static io.smallrye.reactive.messaging.kafka.i18n.KafkaLogging.log;
 
-import java.util.*;
-import java.util.concurrent.*;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedList;
+import java.util.Map;
+import java.util.Queue;
+import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionStage;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.FutureTask;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 import org.apache.kafka.clients.consumer.ConsumerConfig;
+import org.apache.kafka.common.errors.WakeupException;
 
+import io.smallrye.mutiny.tuples.Tuple2;
 import io.smallrye.reactive.messaging.kafka.IncomingKafkaRecord;
 import io.smallrye.reactive.messaging.kafka.KafkaConnectorIncomingConfiguration;
 import io.smallrye.reactive.messaging.kafka.impl.KafkaSource;
@@ -38,7 +52,7 @@ public class KafkaThrottledLatestProcessedCommit extends ContextHolder implement
 
     private static final Map<String, Map<Integer, TopicPartition>> TOPIC_PARTITIONS_CACHE = new ConcurrentHashMap<>();
 
-    private final Map<TopicPartition, OffsetStore> offsetStores = new ConcurrentHashMap<>();
+    private final Map<TopicPartition, OffsetStore> offsetStores = new HashMap<>();
 
     private final KafkaConsumer<?, ?> consumer;
     private final KafkaSource<?, ?> source;
@@ -106,8 +120,26 @@ public class KafkaThrottledLatestProcessedCommit extends ContextHolder implement
     public void partitionsAssigned(Collection<TopicPartition> partitions) {
         stopFlushAndCheckHealthTimer();
 
-        if (!partitions.isEmpty() || !offsetStores.isEmpty()) {
+        if (!partitions.isEmpty()) {
             startFlushAndCheckHealthTimer();
+        } else {
+            FutureTask<Boolean> task = new FutureTask<>(() -> !offsetStores.isEmpty());
+            runOnContext(task);
+
+            Boolean offsetStoreNotEmpty;
+
+            try {
+                //FIXME: Do we block indefinitely or de we timeout?
+                offsetStoreNotEmpty = task.get();
+            } catch (InterruptedException | ExecutionException ex) {
+                //FIXME: Not sure what the right approach here is. If it's InterruptedException I suppose we are shutting down
+                Thread.currentThread().interrupt();
+                throw new WakeupException();
+            }
+
+            if (offsetStoreNotEmpty != null && offsetStoreNotEmpty) {
+                startFlushAndCheckHealthTimer();
+            }
         }
     }
 
@@ -122,22 +154,37 @@ public class KafkaThrottledLatestProcessedCommit extends ContextHolder implement
         stopFlushAndCheckHealthTimer();
 
         // Remove all handled partitions that are not in the given list of partitions
-        Map<TopicPartition, OffsetAndMetadata> toCommit = new HashMap<>();
-        for (TopicPartition partition : new HashSet<>(offsetStores.keySet())) {
-            if (!partitions.contains(partition)) {
-                OffsetStore store = offsetStores.remove(partition);
-                long largestOffset = store.clearLesserSequentiallyProcessedOffsetsAndReturnLargestOffset();
-                if (largestOffset > -1) {
-                    toCommit.put(partition, new OffsetAndMetadata(largestOffset + 1L, null));
+        FutureTask<Tuple2<Map<TopicPartition, OffsetAndMetadata>, Boolean>> task = new FutureTask<>(() -> {
+            Map<TopicPartition, OffsetAndMetadata> toCommit = new HashMap<>();
+            for (TopicPartition partition : new HashSet<>(offsetStores.keySet())) {
+                if (partitions.contains(partition)) {
+                    OffsetStore store = offsetStores.remove(partition);
+                    long largestOffset = store.clearLesserSequentiallyProcessedOffsetsAndReturnLargestOffset();
+                    if (largestOffset > -1) {
+                        toCommit.put(partition, new OffsetAndMetadata(largestOffset + 1L, null));
+                    }
                 }
             }
+            return Tuple2.of(toCommit, !offsetStores.isEmpty());
+        });
+
+        runOnContext(task);
+
+        Tuple2<Map<TopicPartition, OffsetAndMetadata>, Boolean> result;
+        try {
+            //FIXME: Do we block indefinitely or de we timeout?
+            result = task.get();
+        } catch (InterruptedException | ExecutionException ex) {
+            //FIXME: Not sure what the right approach here is. If it's InterruptedException I suppose we are shutting down
+            Thread.currentThread().interrupt();
+            throw new WakeupException();
         }
 
-        if (!toCommit.isEmpty()) {
-            consumer.getDelegate().commit(toCommit);
+        if (result.getItem1() != null && !result.getItem1().isEmpty()) {
+            consumer.getDelegate().commit(result.getItem1());
         }
 
-        if (!offsetStores.isEmpty()) {
+        if (result.getItem2() != null && result.getItem2()) {
             startFlushAndCheckHealthTimer();
         }
     }
